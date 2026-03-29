@@ -1,285 +1,223 @@
 const axios = require("axios");
-const { createCanvas, loadImage } = require('canvas');
-const fs = require('fs-extra');
-const path = require('path');
-const { getStreamFromURL } = global.utils;
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
 
-async function generatePinterestCanvas(imageObjects, query, page, totalPages) {
-  const canvasWidth = 800;
-  const canvasHeight = 1600;
-  const canvas = createCanvas(canvasWidth, canvasHeight);
-  const ctx = canvas.getContext('2d');
+const COMMAND_NAME = "pinterest";
+const PAGE_SIZE = 8;
 
-  ctx.fillStyle = '#1e1e1e';
-  ctx.fillRect(0, 0, canvasWidth, canvasHeight);
-
-  ctx.fillStyle = '#ffffff';
-  ctx.font = '24px Arial';
-  ctx.textAlign = 'left';
-  ctx.fillText('🔍 Pinterest Searcher', 20, 45);
-
-  ctx.font = '16px Arial';
-  ctx.fillStyle = '#b0b0b0';
-  ctx.fillText(`Search results of "${query}", Showing up to ${imageObjects.length} images.`, 20, 75);
-
-  const numColumns = 3;
-  const padding = 15;
-  const columnWidth = (canvasWidth - (padding * (numColumns + 1))) / numColumns;
-  const columnHeights = Array(numColumns).fill(100);
-
-  const loadedPairs = await Promise.all(
-    imageObjects.map(obj =>
-      loadImage(obj.url)
-        .then(img => ({ img, originalIndex: obj.originalIndex, url: obj.url }))
-        .catch(e => {
-          console.error(`Failed to load image: ${obj.url}`, e && e.message);
-          return null;
-        })
-    )
+function isImageUrl(url) {
+  if (typeof url !== "string") return false;
+  return /^https?:\/\/.+/i.test(url) && (
+    /pinimg\.com/i.test(url) ||
+    /\.(jpg|jpeg|png|webp|gif)(\?.*)?$/i.test(url)
   );
+}
 
-  const successful = loadedPairs.filter(x => x !== null);
+function collectImageUrls(input, out = [], seen = new WeakSet()) {
+  if (!input) return out;
 
-  if (successful.length === 0) {
-    ctx.fillStyle = '#ff6666';
-    ctx.font = '16px Arial';
-    ctx.fillText(`No images could be loaded for this page.`, 20, 110);
-    const outputPath = path.join(__dirname, 'cache', `pinterest_page_${Date.now()}.png`);
-    await fs.ensureDir(path.dirname(outputPath));
-    const buffer = canvas.toBuffer('image/png');
-    fs.writeFileSync(outputPath, buffer);
-    return { outputPath, displayedMap: [] };
+  if (typeof input === "string") {
+    if (isImageUrl(input)) out.push(input);
+    return out;
   }
 
-  let displayNumber = 0;
-  const displayedMap = [];
-
-  for (let i = 0; i < successful.length; i++) {
-    const { img, originalIndex } = successful[i];
-
-    const minHeight = Math.min(...columnHeights);
-    const columnIndex = columnHeights.indexOf(minHeight);
-
-    const x = padding + columnIndex * (columnWidth + padding);
-    const y = minHeight + padding;
-
-    const scale = columnWidth / img.width;
-    const scaledHeight = img.height * scale;
-
-    ctx.drawImage(img, x, y, columnWidth, scaledHeight);
-
-    displayNumber += 1;
-    displayedMap.push(originalIndex);
-
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
-    ctx.fillRect(x, y, 50, 24);
-
-    ctx.fillStyle = '#ffffff';
-    ctx.font = 'bold 14px Arial';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(`#${displayNumber}`, x + 25, y + 12);
-
-    ctx.fillStyle = '#b0b0b0';
-    ctx.font = '10px Arial';
-    ctx.textAlign = 'right';
-    ctx.textBaseline = 'alphabetic';
-    ctx.fillText(`${img.width} x ${img.height}`, x + columnWidth - 6, y + scaledHeight - 6);
-
-    columnHeights[columnIndex] += scaledHeight + padding;
+  if (Array.isArray(input)) {
+    for (const item of input) collectImageUrls(item, out, seen);
+    return out;
   }
 
-  ctx.fillStyle = '#ffffff';
-  ctx.font = 'bold 18px Arial';
-  ctx.textAlign = 'center';
-  const footerY = Math.max(...columnHeights) + 40;
-  ctx.fillText(`Anchestor - Page ${page}/${totalPages}`, canvasWidth / 2, footerY);
+  if (typeof input === "object") {
+    if (seen.has(input)) return out;
+    seen.add(input);
 
-  const outputPath = path.join(__dirname, 'cache', `pinterest_page_${Date.now()}.png`);
-  await fs.ensureDir(path.dirname(outputPath));
-  const buffer = canvas.toBuffer('image/png');
-  fs.writeFileSync(outputPath, buffer);
+    for (const value of Object.values(input)) {
+      if (typeof value === "string") {
+        if (isImageUrl(value)) out.push(value);
+      } else if (value && (Array.isArray(value) || typeof value === "object")) {
+        collectImageUrls(value, out, seen);
+      }
+    }
+  }
 
-  return { outputPath, displayedMap };
+  return out;
+}
+
+function unique(arr) {
+  return [...new Set(arr)];
+}
+
+function chunk(arr, size) {
+  const pages = [];
+  for (let i = 0; i < arr.length; i += size) pages.push(arr.slice(i, i + size));
+  return pages;
+}
+
+async function downloadImage(url, filePath) {
+  const res = await axios.get(url, {
+    responseType: "arraybuffer",
+    timeout: 30000,
+    headers: {
+      "User-Agent": "Mozilla/5.0"
+    }
+  });
+  fs.writeFileSync(filePath, Buffer.from(res.data));
+}
+
+function safeExtFromUrl(url) {
+  try {
+    const ext = path.extname(new URL(url).pathname);
+    if (ext && ext.length <= 5) return ext;
+  } catch (e) {}
+  return ".jpg";
+}
+
+async function loadPinterestModule() {
+  return await import("@myno_21/pinterest-scraper");
+}
+
+async function buildPageFiles(urls, pageIndex) {
+  const dir = path.join(os.tmpdir(), "stbot_pinterest");
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+  const files = [];
+  for (let i = 0; i < urls.length; i++) {
+    const ext = safeExtFromUrl(urls[i]);
+    const filePath = path.join(dir, `pin_${Date.now()}_${pageIndex}_${i}${ext}`);
+    await downloadImage(urls[i], filePath);
+    files.push(filePath);
+  }
+  return files;
+}
+
+async function sendPage(api, threadID, replyTo, title, query, pageIndex, pagesCount, pageUrls) {
+  const files = await buildPageFiles(pageUrls, pageIndex);
+  const attachments = files.map((file) => fs.createReadStream(file));
+
+  const body =
+    `🖼️ Pinterest\n` +
+    `🔎 ${query}\n` +
+    `📄 ${pageIndex + 1}/${pagesCount}\n\n` +
+    `1\n2`;
+
+  const msg = await new Promise((resolve, reject) => {
+    api.sendMessage(
+      {
+        body,
+        attachment: attachments
+      },
+      threadID,
+      (err, info) => {
+        if (err) return reject(err);
+        resolve(info);
+      },
+      replyTo
+    );
+  });
+
+  setTimeout(() => {
+    for (const file of files) {
+      try {
+        if (fs.existsSync(file)) fs.unlinkSync(file);
+      } catch (e) {}
+    }
+  }, 15000);
+
+  return msg;
 }
 
 module.exports = {
   config: {
-    name: "pinterest",
-    aliases: ["Pinterest", "pin"],
-    version: "2.4.78",
-    author: "Mahi--",
-    countDown: 10,
+    name: COMMAND_NAME,
+    aliases: ["pin", "pinterest", "pins"],
+    version: "1.0.0",
+    author: "OpenAI",
+    countDown: 3,
     role: 0,
-    shortDescription: "Search Pinterest for images",
-    longDescription: "Search Pinterest for images, with canvas view for Browse.",
-    category: "Image",
-    guide: {
-      en: "{pn} query [-count]\n" +
-        "• If count is used, it sends images directly.\n" +
-        "• If no count, it shows an interactive canvas.\n" +
-        "• Example: {pn} cute cat -5 (direct send)\n" +
-        "• Example: {pn} anime wallpaper (canvas view)"
-    }
+    premium: false,
+    usePrefix: true,
+    description: "Pinterest search with interactive paging and image downloads",
+    category: "tools",
+    guide: "{pn} <search>"
   },
 
-  ST: async function({ api, args, message, event }) {
-    let processingMessage = null;
+  onStart: async function ({ api, event, args }) {
     try {
-      let count = null;
-      const countArg = args.find(arg => /^-\d+$/.test(arg));
-      if (countArg) {
-        count = parseInt(countArg.slice(1), 10);
-        args = args.filter(arg => arg !== countArg);
+      if (!args.length) {
+        return api.sendMessage("❌", event.threadID, event.messageID);
       }
+
+      try {
+        api.setMessageReaction("🖼️", event.messageID, () => {}, true);
+      } catch (e) {}
+
       const query = args.join(" ").trim();
-      if (!query) {
-        return message.reply("Please provide a search query.");
+      const Pinterest = await loadPinterestModule();
+      const searchPins = Pinterest.searchPins;
+
+      if (typeof searchPins !== "function") {
+        return api.sendMessage("❌", event.threadID, event.messageID);
       }
 
-      processingMessage = await message.reply("🔍 Searching on Pinterest...");
+      const result = await searchPins(query);
+      const rawUrls = collectImageUrls(result);
+      const urls = unique(rawUrls).filter(isImageUrl);
 
-      const res = await axios.get(`https://egret-driving-cattle.ngrok-free.app/api/pin?query=${encodeURIComponent(query)}&num=90`);
-      const allImageUrls = res.data.results || [];
-
-      if (allImageUrls.length === 0) {
-        if (processingMessage) await message.unsend(processingMessage.messageID).catch(() => { });
-        return message.reply(`No images found for "${query}".`);
+      if (!urls.length) {
+        return api.sendMessage("❌", event.threadID, event.messageID);
       }
 
-      if (count) {
-        const urls = allImageUrls.slice(0, count);
-        const streams = await Promise.all(urls.map(url => getStreamFromURL(url).catch(() => null)));
-        const validStreams = streams.filter(s => s);
+      const pages = chunk(urls, PAGE_SIZE);
+      const first = await sendPage(api, event.threadID, event.messageID, COMMAND_NAME, query, 0, pages.length, pages[0]);
 
-        if (processingMessage) await message.unsend(processingMessage.messageID).catch(() => { });
-
-        return message.reply({
-          body: `Here are ${validStreams.length} image(s) for "${query}":`,
-          attachment: validStreams
-        });
-
-      } else {
-        const imagesPerPage = 21;
-        const totalPages = Math.ceil(allImageUrls.length / imagesPerPage);
-        const startIndex = 0;
-        const endIndex = Math.min(allImageUrls.length, imagesPerPage);
-        const imagesForPage1 = allImageUrls.slice(startIndex, endIndex).map((url, idx) => ({
-          url,
-          originalIndex: startIndex + idx
-        }));
-
-        const { outputPath: canvasPath, displayedMap } = await generatePinterestCanvas(imagesForPage1, query, 1, totalPages);
-
-        const sentMessage = await message.reply({
-          body: `🖼️ Found ${allImageUrls.length} images for "${query}".\nReply with a number (shown on canvas) to get that image, or "next" for more.`,
-          attachment: fs.createReadStream(canvasPath)
-        });
-
-        fs.unlink(canvasPath, (err) => {
-          if (err) console.error(err);
-        });
-
-        global.GoatBot.onReply.set(sentMessage.messageID, {
-          commandName: this.config.name,
-          author: event.senderID,
-          allImageUrls,
-          query,
-          imagesPerPage,
-          currentPage: 1,
-          totalPages,
-          displayedMap,
-          displayCount: Array.isArray(displayedMap) ? displayedMap.length : 0
-        });
-
-        if (processingMessage) await message.unsend(processingMessage.messageID).catch(() => { });
-      }
-
-    } catch (error) {
-      console.error(error);
-      if (processingMessage) {
-        try { await message.unsend(processingMessage.messageID); } catch (e) { }
-      }
-      message.reply("An error occurred. The server or API might be down.");
+      global.GoatBot.onReply.set(first.messageID, {
+        commandName: COMMAND_NAME,
+        author: event.senderID,
+        query,
+        pages,
+        pageIndex: 0
+      });
+    } catch (err) {
+      return api.sendMessage("❌", event.threadID, event.messageID);
     }
   },
 
-  onReply: async function({ api, event, message, Reply }) {
+  onReply: async function ({ api, event, Reply }) {
+    if (!Reply || Reply.commandName !== COMMAND_NAME) return;
+    if (event.senderID !== Reply.author) return;
+
+    const body = String(event.body || "").trim();
+    if (body !== "1" && body !== "2") return;
+
+    const pages = Reply.pages || [];
+    if (!pages.length) return;
+
+    let pageIndex = Number(Reply.pageIndex || 0);
+
+    if (body === "1") pageIndex = (pageIndex + 1) % pages.length;
+    if (body === "2") pageIndex = (pageIndex - 1 + pages.length) % pages.length;
+
     try {
-      if (!Reply) return message.reply("Session expired. Please run the command again.");
+      api.setMessageReaction("📌", event.messageID, () => {}, true);
+    } catch (e) {}
 
-      const { author, allImageUrls, query, imagesPerPage, currentPage, totalPages, displayedMap, displayCount } = Reply;
-      if (event.senderID !== author) return;
+    const sent = await sendPage(
+      api,
+      event.threadID,
+      event.messageID,
+      COMMAND_NAME,
+      Reply.query || "Pinterest",
+      pageIndex,
+      pages.length,
+      pages[pageIndex]
+    );
 
-      const input = (event.body || "").trim().toLowerCase();
-
-      if (input === 'next') {
-        if (currentPage >= totalPages) {
-          return message.reply("This is the last page of results.");
-        }
-        const nextPage = currentPage + 1;
-        const startIndex = (nextPage - 1) * imagesPerPage;
-        const endIndex = Math.min(startIndex + imagesPerPage, allImageUrls.length);
-
-        const imagesForNextPage = allImageUrls.slice(startIndex, endIndex).map((url, idx) => ({
-          url,
-          originalIndex: startIndex + idx
-        }));
-
-        const processingMessage = await message.reply(`Loading page ${nextPage}...`);
-        const { outputPath: canvasPath, displayedMap: nextDisplayedMap } = await generatePinterestCanvas(imagesForNextPage, query, nextPage, totalPages);
-
-        const sentMessage = await message.reply({
-          body: `🖼️ Page ${nextPage}/${totalPages}.\nReply with a number (shown on canvas) to get that image, or "next" for more.`,
-          attachment: fs.createReadStream(canvasPath)
-        });
-        fs.unlink(canvasPath, (err) => {
-          if (err) console.error(err);
-        });
-
-        await message.unsend(processingMessage.messageID).catch(() => { });
-
-        global.GoatBot.onReply.set(sentMessage.messageID, {
-          commandName: this.config.name,
-          author,
-          allImageUrls,
-          query,
-          imagesPerPage,
-          currentPage: nextPage,
-          totalPages,
-          displayedMap: nextDisplayedMap,
-          displayCount: Array.isArray(nextDisplayedMap) ? nextDisplayedMap.length : 0
-        });
-
-      } else {
-        const number = parseInt(input, 10);
-        if (!isNaN(number) && number > 0) {
-          if (!Array.isArray(displayedMap) || typeof displayCount !== 'number') {
-            return message.reply("This page's images aren't available anymore. Please run the command again or type 'next'.");
-          }
-
-          if (number > displayCount) {
-            return message.reply(`Invalid number. The current canvas shows only ${displayCount} image(s). Choose a number from 1 to ${displayCount}, or type "next" to load more images.`);
-          }
-
-          const originalIndex = displayedMap[number - 1];
-          if (originalIndex == null || originalIndex < 0 || originalIndex >= allImageUrls.length) {
-            return message.reply(`Could not find that image. Please try again or request a different number.`);
-          }
-          const imageUrl = allImageUrls[originalIndex];
-          const stream = await getStreamFromURL(imageUrl).catch(() => null);
-          if (!stream) return message.reply("Failed to fetch the requested image.");
-          await message.reply({
-            body: `Image #${number} for query "${query}":`,
-            attachment: stream
-          });
-        } else {
-          return message.reply(`Reply with a number (from the canvas) to get that image, or "next" for more pages.`);
-        }
-      }
-    } catch (error) {
-      console.error(error);
-      message.reply("An error occurred while handling your reply.");
-    }
+    global.GoatBot.onReply.set(sent.messageID, {
+      commandName: COMMAND_NAME,
+      author: Reply.author,
+      query: Reply.query,
+      pages,
+      pageIndex
+    });
   }
 };
